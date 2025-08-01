@@ -1,0 +1,197 @@
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "<project>-frontend"
+        CONTAINER_NAME = "<project>-frontend-container"
+        DOCKERFILE_DIR = "<dir>"
+        DEPLOYMENT_URL = "https://yudhishtran.com"
+
+        FRONTEND_EMAIL = ""
+        DEV_EMAIL = ""
+        DEVOPS_EMAIL = ""
+        MANAGER_EMAIL = ""
+        QA_EMAIL = ""
+        SLACK_CHANNEL = "#ci-cd"
+    }
+
+    stages {
+        stage('Initialize Build User and Notify via Slack') {
+            steps {
+                wrap([$class: 'BuildUser']) {
+                    script {
+                        def triggerUser = env.BUILD_USER ?: "Auto Trigger"
+                        currentBuild.description = triggerUser
+
+                        slackSend(
+                            channel: "${env.SLACK_CHANNEL}",
+                            color: "#439FE0",
+                            message: """
+                            *🛠️ <proj>-Frontend Build Started*
+                            *Started By:* `${triggerUser}`
+                            *Job:* `${env.JOB_NAME}`
+                            *Build:* #${env.BUILD_NUMBER}
+                            *URL:* ${env.BUILD_URL}
+                            """
+                        )
+                    }
+                }
+            }
+        }
+
+        stage('Checkout') {
+            steps {
+                echo "Checking out code..."
+                // Example: checkout scm
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    def backupTag = sh(script: "date +'%Y-%m-%d-%H-%M-%S'", returnStdout: true).trim()
+                    writeFile file: 'backup_tag.txt', text: backupTag
+                    def imageNameBackup = "${env.IMAGE_NAME}:${backupTag}"
+
+                    def existingImageId = sh(
+                        script: "docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' | grep '^${env.IMAGE_NAME}:' | awk '{print \$2}' | head -n 1",
+                        returnStdout: true
+                    ).trim()
+
+                    if (existingImageId) {
+                        echo "Backing up existing image as ${imageNameBackup}..."
+                        sh "docker tag ${env.IMAGE_NAME} ${imageNameBackup}"
+                    } else {
+                        echo "No existing image found to back up."
+                    }
+
+                    echo "Stopping and removing existing container if exists..."
+                    sh "docker ps -a | grep ${env.CONTAINER_NAME} && docker stop ${env.CONTAINER_NAME} && docker rm -f ${env.CONTAINER_NAME} || true"
+
+                    echo "Building the Docker image from ${env.DOCKERFILE_DIR}..."
+                    sh "docker build --no-cache -t ${env.IMAGE_NAME} -f ${env.DOCKERFILE_DIR}/Dockerfile ${env.DOCKERFILE_DIR}"
+                }
+            }
+        }
+
+        stage('Deploy Container') {
+            steps {
+                script {
+                    echo "Running the new container on port 8065..."
+                    sh "docker run -itd -p 443:3000 --restart=always --name ${env.CONTAINER_NAME} ${env.IMAGE_NAME}"
+
+                    echo "Checking container status..."
+                    sh "docker ps -a | grep ${env.CONTAINER_NAME}"
+                }
+            }
+        }
+
+        stage('Notify Team (Email)') {
+            steps {
+                script {
+                    if (currentBuild.result == null || currentBuild.result == 'SUCCESS' || currentBuild.result == 'ABORTED') {
+                        emailext(
+                            subject: "✅ <project> Frontend Deployed to Testing - #${env.BUILD_NUMBER}",
+                            to: "${env.DEV_EMAIL},${env.DEVOPS_EMAIL},${env.FRONTEND_EMAIL},${env.MANAGER_EMAIL},${env.QA_EMAIL}",
+                            mimeType: 'text/html',
+                            body: """
+                            <p>Hi Team,</p>
+
+                            <p>The latest <project> Frontend build has been successfully deployed and is ready for testing. Details below:</p>
+
+                            <ul>
+                                <li><strong>Project:</strong> MMU Frontend </li>
+                                <li><strong>Environment:</strong> Testing</li>
+                                <li><strong>Deployment Date and Time:</strong> ${new Date().format("dd-MM-yyyy HH:mm", TimeZone.getTimeZone('Asia/Kolkata'))}</li>
+                                <li><strong>URL:</strong> <a href="${env.DEPLOYMENT_URL}">${env.DEPLOYMENT_URL}</a></li>
+                            </ul>
+
+                            <p>Please begin testing and report any issues via JIRA or to the dev team.</p>
+
+                            <p>Regards,<br/>
+                            Jenkins - Cloud & DevOps</p>
+                            <hr/>
+                            <p>
+                              <b>Build Info:</b><br/>
+                              Job: <a href="${env.BUILD_URL}">${env.JOB_NAME} #${env.BUILD_NUMBER}</a><br/>
+                              Status: SUCCESS<br/>
+                              Triggered by: ${currentBuild.description} <br/>
+                            </p>
+                            """
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Pipeline failed. Rolling back to previous Docker image if available."
+
+            script {
+                def backupTag = readFile('backup_tag.txt').trim()
+                def imageNameBackup = "${env.IMAGE_NAME}:${backupTag}"
+
+                try {
+                    echo "Stopping and removing faulty container..."
+                    sh "docker stop ${env.CONTAINER_NAME} || true"
+                    sh "docker rm -f ${env.CONTAINER_NAME} || true"
+
+                    echo "Attempting rollback to backup image: ${imageNameBackup}"
+                    sh "docker run -itd -p 8065:3000 --restart=always --name ${env.CONTAINER_NAME} ${imageNameBackup}"
+
+                    echo "Rollback successful."
+
+                    slackSend(
+                        channel: "${env.SLACK_CHANNEL}",
+                        color: "#FF0000",
+                        message: """
+                        ❌ *<project> Frontend Build Failed & Rolled Back*
+                        *Rollback Image:* `${imageNameBackup}`
+                        *Container:* `${env.CONTAINER_NAME}`
+                        *Build:* #${env.BUILD_NUMBER}
+                        *URL:* ${env.BUILD_URL}
+                        """
+                    )
+                } catch (err) {
+                    echo "Rollback failed: ${err}"
+
+                    slackSend(
+                        channel: "${env.SLACK_CHANNEL}",
+                        color: "#FF0000",
+                        message: """
+                        ❌ *<project> Frontend Build Failed*
+                        ⚠️ *Rollback Attempted but Failed!*
+                        *Build:* #${env.BUILD_NUMBER}
+                        *URL:* ${env.BUILD_URL}
+                        """
+                    )
+                }
+            }
+
+            emailext(
+                subject: "❌ <project> Frontend Build Failed - Rolled Back - #${env.BUILD_NUMBER}",
+                to: "${env.DEV_EMAIL},${env.DEVOPS_EMAIL},${env.FRONTEND_EMAIL},${env.MANAGER_EMAIL},${env.QA_EMAIL}",
+                mimeType: 'text/html',
+                body: """
+                <p>Hi Team,</p>
+
+                <p>The latest <project> Frontend build has <strong>failed</strong>, and the previous stable Docker image was <strong>automatically rolled back</strong>.</p>
+
+                <ul>
+                    <li><strong>Project:</strong> <project> Frontend</li>
+                    <li><strong>Environment:</strong> Testing</li>
+                    <li><strong>Build Number:</strong> ${env.BUILD_NUMBER}</li>
+                    <li><strong>Job URL:</strong> <a href="${env.BUILD_URL}">${env.BUILD_URL}</a></li>
+                </ul>
+
+                <p>Please check the console logs and fix the issue.</p>
+
+                <p>Regards,<br/>
+                Jenkins - Cloud & DevOps</p>
+                """
+            )
+        }
+    }
+}
