@@ -1,0 +1,16 @@
+#!/bin/bash
+
+DOMAIN="yudhishtran.com"
+DEST="/etc/nginx/ssl/${DOMAIN//./_}.p12"
+CERT="/etc/letsencrypt/live/$DOMAIN/cert.pem"
+KEY="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+CHAIN="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+
+openssl pkcs12 -export \
+  -out "$DEST" \
+  -inkey "$KEY" \
+  -in "$CERT" \
+  -certfile "$CHAIN" \
+  -passout pass:mypassword
+
+echo "[+] PKCS#12 file generated at $DEST"
